@@ -25,14 +25,15 @@ const SIZE_MAP = {
   '96': 170.08,   // L = 6 × 6 cm
 };
 
-/** Fallback colours used when Office theme is unavailable */
+/** ShapR brand colours */
 const DEFAULT_COLORS = [
+  { hex: '#0B2B45', name: 'ShapR Navy' },
+  { hex: '#F2BE22', name: 'ShapR Yellow' },
+  { hex: '#185359', name: 'ShapR Teal' },
+  { hex: '#30A5BF', name: 'ShapR Cyan' },
+  { hex: '#D8256A', name: 'ShapR Pink' },
   { hex: '#000000', name: 'Black' },
-  { hex: '#343A40', name: 'Dark Gray' },
-  { hex: '#868E96', name: 'Gray' },
   { hex: '#FFFFFF', name: 'White' },
-  { hex: '#1971C2', name: 'Blue' },
-  { hex: '#C92A2A', name: 'Red' },
 ];
 
 /** Approx card height including gap — used for virtual scroll row math */
@@ -143,14 +144,6 @@ async function startApp() {
   initColorSwatches(DEFAULT_COLORS);
   bindControls();
   loadIcons();
-
-  /* Load real theme colours in the background — don't block UI */
-  getThemeColors().then((colors) => {
-    if (colors !== DEFAULT_COLORS) {
-      initColorSwatches(colors);
-      refreshCardPreviews();
-    }
-  });
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -497,96 +490,6 @@ function initColorSwatches(colors) {
   syncHexInput(colors[0].hex);
 }
 
-/**
- * Read theme colours from the PPTX by extracting ppt/theme/theme1.xml.
- * Runs in the background — never blocks the UI.
- */
-async function getThemeColors() {
-  if (!state.officeAvailable || typeof JSZip === 'undefined') return DEFAULT_COLORS;
-
-  try {
-    /* 1. Get file handle */
-    const file = await new Promise((resolve, reject) => {
-      Office.context.document.getFileAsync(
-        Office.FileType.Compressed,
-        { sliceSize: 4194304 },
-        (r) => r.status === Office.AsyncResultStatus.Succeeded
-          ? resolve(r.value)
-          : reject(new Error(r.error.message)),
-      );
-    });
-
-    /* 2. Read all slices */
-    const parts = [];
-    for (let i = 0; i < file.sliceCount; i++) {
-      const data = await new Promise((resolve, reject) => {
-        file.getSliceAsync(i, (r) => r.status === Office.AsyncResultStatus.Succeeded
-          ? resolve(r.value.data)
-          : reject(new Error(r.error.message)));
-      });
-      parts.push(data);
-    }
-    file.closeAsync();
-
-    /* 3. Concat into one buffer */
-    const total = parts.reduce((n, p) => n + p.byteLength, 0);
-    const buf   = new Uint8Array(total);
-    let off = 0;
-    for (const p of parts) { buf.set(new Uint8Array(p), off); off += p.byteLength; }
-
-    /* 4. Extract theme XML */
-    const zip = await JSZip.loadAsync(buf);
-    const themeEntry = zip.file('ppt/theme/theme1.xml');
-    if (!themeEntry) return DEFAULT_COLORS;
-    const xml = await themeEntry.async('text');
-
-    /* 5. Parse colour scheme */
-    const doc = new DOMParser().parseFromString(xml, 'application/xml');
-    const ns  = 'http://schemas.openxmlformats.org/drawingml/2006/main';
-    const scheme = doc.getElementsByTagNameNS(ns, 'clrScheme')[0];
-    if (!scheme) return DEFAULT_COLORS;
-
-    const TAGS = [
-      { tag: 'dk1',      name: 'Dark 1' },
-      { tag: 'lt1',      name: 'Light 1' },
-      { tag: 'dk2',      name: 'Dark 2' },
-      { tag: 'lt2',      name: 'Light 2' },
-      { tag: 'accent1',  name: 'Accent 1' },
-      { tag: 'accent2',  name: 'Accent 2' },
-      { tag: 'accent3',  name: 'Accent 3' },
-      { tag: 'accent4',  name: 'Accent 4' },
-      { tag: 'accent5',  name: 'Accent 5' },
-      { tag: 'accent6',  name: 'Accent 6' },
-      { tag: 'hlink',    name: 'Hyperlink' },
-      { tag: 'folHlink', name: 'Followed Hyperlink' },
-    ];
-
-    const result = [];
-    for (const { tag, name } of TAGS) {
-      const el = scheme.getElementsByTagNameNS(ns, tag)[0];
-      if (!el) continue;
-      const srgb = el.getElementsByTagNameNS(ns, 'srgbClr')[0];
-      const sys  = el.getElementsByTagNameNS(ns, 'sysClr')[0];
-      const hex  = srgb ? normalizeHex(srgb.getAttribute('val'))
-                 : sys  ? normalizeHex(sys.getAttribute('lastClr'))
-                 : null;
-      if (hex) result.push({ hex, name });
-    }
-
-    if (result.length >= 2) {
-      const seen = new Set();
-      return result.filter((c) => {
-        const key = c.hex.toUpperCase();
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-    }
-  } catch (err) {
-    console.warn('[ShapR] Could not read theme colors:', err.message);
-  }
-  return DEFAULT_COLORS;
-}
 
 /** Ensure hex string is #RRGGBB */
 function normalizeHex(raw) {
