@@ -136,7 +136,7 @@ function initOffice() {
 ═══════════════════════════════════════════════════════════════════ */
 
 async function startApp() {
-  await initColorSwatches();
+  initColorSwatches(getThemeColors());
   bindControls();
   loadIcons();
 }
@@ -440,13 +440,13 @@ function refreshCardPreviews() {
 ═══════════════════════════════════════════════════════════════════ */
 
 /**
- * Build colour swatches from the presentation theme (if available) or defaults.
- * Called once during startApp(), before bindControls.
+ * Populate the colour swatch strip from the given colour array.
  */
-async function initColorSwatches() {
-  const colors    = await getThemeColors();
+function initColorSwatches(colors) {
   const container = els.colorSwatches();
   if (!container) return;
+
+  container.innerHTML = '';
 
   colors.forEach((c, i) => {
     const label      = document.createElement('label');
@@ -483,101 +483,40 @@ async function initColorSwatches() {
   syncHexInput(colors[0].hex);
 }
 
-
 /**
- * Read colours from the active presentation's OOXML theme file.
- * Opens the PPTX as a ZIP via JSZip, parses ppt/theme/theme1.xml,
- * and extracts the <a:clrScheme> entries.  Falls back to DEFAULT_COLORS
- * when Office or JSZip is unavailable.
+ * Read theme colours from the OfficeThemes.css probe elements.
+ * Office.js dynamically updates the CSS classes to match the presentation's
+ * active theme — we just read their computed styles.  Instant, no file I/O.
  */
-async function getThemeColors() {
-  if (!state.officeAvailable || typeof JSZip === 'undefined') return DEFAULT_COLORS;
+function getThemeColors() {
+  const PROBES = [
+    { cls: 'office-docTheme-primary-fontColor', prop: 'color',           name: 'Dark 1' },
+    { cls: 'office-docTheme-primary-bgColor',   prop: 'backgroundColor', name: 'Light 1' },
+    { cls: 'office-docTheme-secondary-fontColor', prop: 'color',         name: 'Dark 2' },
+    { cls: 'office-docTheme-secondary-bgColor', prop: 'backgroundColor', name: 'Light 2' },
+    { cls: 'office-contentAccent1-bgColor', prop: 'backgroundColor', name: 'Accent 1' },
+    { cls: 'office-contentAccent2-bgColor', prop: 'backgroundColor', name: 'Accent 2' },
+    { cls: 'office-contentAccent3-bgColor', prop: 'backgroundColor', name: 'Accent 3' },
+    { cls: 'office-contentAccent4-bgColor', prop: 'backgroundColor', name: 'Accent 4' },
+    { cls: 'office-contentAccent5-bgColor', prop: 'backgroundColor', name: 'Accent 5' },
+    { cls: 'office-contentAccent6-bgColor', prop: 'backgroundColor', name: 'Accent 6' },
+    { cls: 'office-a',                      prop: 'color',           name: 'Hyperlink' },
+  ];
 
   try {
-    /* ── 1. Get PPTX bytes via the Common API ── */
-    const fileBytes = await new Promise((resolve, reject) => {
-      Office.context.document.getFileAsync(
-        Office.FileType.Compressed,
-        { sliceSize: 65536 },
-        async (result) => {
-          if (result.status !== Office.AsyncResultStatus.Succeeded) {
-            return reject(new Error(result.error.message));
-          }
-          const file       = result.value;
-          const sliceCount = file.sliceCount;
-          const parts      = [];
+    const container = document.getElementById('theme-probes');
+    if (!container) return DEFAULT_COLORS;
 
-          for (let i = 0; i < sliceCount; i++) {
-            const slice = await new Promise((res, rej) => {
-              file.getSliceAsync(i, (sr) => {
-                if (sr.status === Office.AsyncResultStatus.Succeeded) res(sr.value.data);
-                else rej(new Error(sr.error.message));
-              });
-            });
-            parts.push(slice);
-          }
-          file.closeAsync();
-
-          /* Concatenate Uint8Arrays */
-          const total = parts.reduce((n, p) => n + p.byteLength, 0);
-          const buf   = new Uint8Array(total);
-          let offset  = 0;
-          for (const p of parts) {
-            buf.set(new Uint8Array(p), offset);
-            offset += p.byteLength;
-          }
-          resolve(buf);
-        },
-      );
-    });
-
-    /* ── 2. Unzip and find the theme XML ── */
-    const zip = await JSZip.loadAsync(fileBytes);
-    const themeFile = zip.file('ppt/theme/theme1.xml');
-    if (!themeFile) return DEFAULT_COLORS;
-
-    const themeXml = await themeFile.async('text');
-
-    /* ── 3. Parse <a:clrScheme> ── */
-    const parser  = new DOMParser();
-    const doc     = parser.parseFromString(themeXml, 'application/xml');
-    const ns      = 'http://schemas.openxmlformats.org/drawingml/2006/main';
-
-    /* Tag → friendly name mapping (same order PowerPoint uses) */
-    const COLOR_TAGS = [
-      { tag: 'dk1',     name: 'Dark 1' },
-      { tag: 'lt1',     name: 'Light 1' },
-      { tag: 'dk2',     name: 'Dark 2' },
-      { tag: 'lt2',     name: 'Light 2' },
-      { tag: 'accent1', name: 'Accent 1' },
-      { tag: 'accent2', name: 'Accent 2' },
-      { tag: 'accent3', name: 'Accent 3' },
-      { tag: 'accent4', name: 'Accent 4' },
-      { tag: 'accent5', name: 'Accent 5' },
-      { tag: 'accent6', name: 'Accent 6' },
-      { tag: 'hlink',   name: 'Hyperlink' },
-      { tag: 'folHlink', name: 'Followed Hyperlink' },
-    ];
-
-    const scheme = doc.getElementsByTagNameNS(ns, 'clrScheme')[0];
-    if (!scheme) return DEFAULT_COLORS;
-
+    const spans = container.querySelectorAll('span');
     const result = [];
-    for (const { tag, name } of COLOR_TAGS) {
-      const el = scheme.getElementsByTagNameNS(ns, tag)[0];
-      if (!el) continue;
 
-      /* Colour can be <a:srgbClr val="4472C4"/> or <a:sysClr lastClr="000000"/> */
-      const srgb = el.getElementsByTagNameNS(ns, 'srgbClr')[0];
-      const sys  = el.getElementsByTagNameNS(ns, 'sysClr')[0];
-      const hex  = srgb
-        ? normalizeHex(srgb.getAttribute('val'))
-        : sys
-          ? normalizeHex(sys.getAttribute('lastClr'))
-          : null;
-
-      if (hex) result.push({ hex, name });
-    }
+    PROBES.forEach((probe, i) => {
+      const el = spans[i];
+      if (!el) return;
+      const raw = getComputedStyle(el)[probe.prop];
+      const hex = rgbToHex(raw);
+      if (hex) result.push({ hex, name: probe.name });
+    });
 
     if (result.length >= 2) {
       /* Deduplicate while preserving order */
@@ -594,6 +533,16 @@ async function getThemeColors() {
   }
 
   return DEFAULT_COLORS;
+}
+
+/** Convert an rgb(r, g, b) string to #RRGGBB */
+function rgbToHex(rgb) {
+  const m = String(rgb).match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+  if (!m) return null;
+  const r = parseInt(m[1], 10);
+  const g = parseInt(m[2], 10);
+  const b = parseInt(m[3], 10);
+  return '#' + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1).toUpperCase();
 }
 
 /** Ensure hex string is #RRGGBB */
