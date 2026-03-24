@@ -18,8 +18,12 @@ const SPRITE_URLS = [
   'https://unpkg.com/@tabler/icons@latest/tabler-sprite.svg',
 ];
 
-/** px dimensions matched to S / M / L labels */
-const SIZE_MAP = { '32': 32, '64': 64, '96': 96 };
+/** Insertion sizes in points (1 cm ≈ 28.35 pt) */
+const SIZE_MAP = {
+  '32':  28.35,   // S = 1 × 1 cm
+  '64':  85.04,   // M = 3 × 3 cm
+  '96': 170.08,   // L = 6 × 6 cm
+};
 
 /** Fallback colours used when Office theme is unavailable */
 const DEFAULT_COLORS = [
@@ -54,7 +58,7 @@ const state = {
   selectedColor: '#0B2B45',
 
   /** Insertion size in px */
-  selectedSize: 64,
+  selectedSize: 85.04,
 
   /** Whether Office.js is available */
   officeAvailable: false,
@@ -136,9 +140,17 @@ function initOffice() {
 ═══════════════════════════════════════════════════════════════════ */
 
 async function startApp() {
-  initColorSwatches(getThemeColors());
+  initColorSwatches(DEFAULT_COLORS);
   bindControls();
   loadIcons();
+
+  /* Load real theme colours in the background — don't block UI */
+  getThemeColors().then((colors) => {
+    if (colors !== DEFAULT_COLORS) {
+      initColorSwatches(colors);
+      refreshCardPreviews();
+    }
+  });
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -415,9 +427,11 @@ function selectColor(hex) {
   refreshCardPreviews();
 }
 
-function selectSize(px) {
-  state.selectedSize = parseInt(px, 10);
-  els.sizeDisplay().textContent = `${px}px`;
+const SIZE_CM_LABELS = { '32': '1 cm', '64': '3 cm', '96': '6 cm' };
+
+function selectSize(key) {
+  state.selectedSize = SIZE_MAP[key];
+  els.sizeDisplay().textContent = SIZE_CM_LABELS[key] || key;
 }
 
 /** Update all currently-rendered SVG previews to the active colour */
@@ -484,42 +498,82 @@ function initColorSwatches(colors) {
 }
 
 /**
- * Read theme colours from the OfficeThemes.css probe elements.
- * Office.js dynamically updates the CSS classes to match the presentation's
- * active theme — we just read their computed styles.  Instant, no file I/O.
+ * Read theme colours from the PPTX by extracting ppt/theme/theme1.xml.
+ * Runs in the background — never blocks the UI.
  */
-function getThemeColors() {
-  const PROBES = [
-    { cls: 'office-docTheme-primary-fontColor', prop: 'color',           name: 'Dark 1' },
-    { cls: 'office-docTheme-primary-bgColor',   prop: 'backgroundColor', name: 'Light 1' },
-    { cls: 'office-docTheme-secondary-fontColor', prop: 'color',         name: 'Dark 2' },
-    { cls: 'office-docTheme-secondary-bgColor', prop: 'backgroundColor', name: 'Light 2' },
-    { cls: 'office-contentAccent1-bgColor', prop: 'backgroundColor', name: 'Accent 1' },
-    { cls: 'office-contentAccent2-bgColor', prop: 'backgroundColor', name: 'Accent 2' },
-    { cls: 'office-contentAccent3-bgColor', prop: 'backgroundColor', name: 'Accent 3' },
-    { cls: 'office-contentAccent4-bgColor', prop: 'backgroundColor', name: 'Accent 4' },
-    { cls: 'office-contentAccent5-bgColor', prop: 'backgroundColor', name: 'Accent 5' },
-    { cls: 'office-contentAccent6-bgColor', prop: 'backgroundColor', name: 'Accent 6' },
-    { cls: 'office-a',                      prop: 'color',           name: 'Hyperlink' },
-  ];
+async function getThemeColors() {
+  if (!state.officeAvailable || typeof JSZip === 'undefined') return DEFAULT_COLORS;
 
   try {
-    const container = document.getElementById('theme-probes');
-    if (!container) return DEFAULT_COLORS;
-
-    const spans = container.querySelectorAll('span');
-    const result = [];
-
-    PROBES.forEach((probe, i) => {
-      const el = spans[i];
-      if (!el) return;
-      const raw = getComputedStyle(el)[probe.prop];
-      const hex = rgbToHex(raw);
-      if (hex) result.push({ hex, name: probe.name });
+    /* 1. Get file handle */
+    const file = await new Promise((resolve, reject) => {
+      Office.context.document.getFileAsync(
+        Office.FileType.Compressed,
+        { sliceSize: 4194304 },
+        (r) => r.status === Office.AsyncResultStatus.Succeeded
+          ? resolve(r.value)
+          : reject(new Error(r.error.message)),
+      );
     });
 
+    /* 2. Read all slices */
+    const parts = [];
+    for (let i = 0; i < file.sliceCount; i++) {
+      const data = await new Promise((resolve, reject) => {
+        file.getSliceAsync(i, (r) => r.status === Office.AsyncResultStatus.Succeeded
+          ? resolve(r.value.data)
+          : reject(new Error(r.error.message)));
+      });
+      parts.push(data);
+    }
+    file.closeAsync();
+
+    /* 3. Concat into one buffer */
+    const total = parts.reduce((n, p) => n + p.byteLength, 0);
+    const buf   = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) { buf.set(new Uint8Array(p), off); off += p.byteLength; }
+
+    /* 4. Extract theme XML */
+    const zip = await JSZip.loadAsync(buf);
+    const themeEntry = zip.file('ppt/theme/theme1.xml');
+    if (!themeEntry) return DEFAULT_COLORS;
+    const xml = await themeEntry.async('text');
+
+    /* 5. Parse colour scheme */
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    const ns  = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+    const scheme = doc.getElementsByTagNameNS(ns, 'clrScheme')[0];
+    if (!scheme) return DEFAULT_COLORS;
+
+    const TAGS = [
+      { tag: 'dk1',      name: 'Dark 1' },
+      { tag: 'lt1',      name: 'Light 1' },
+      { tag: 'dk2',      name: 'Dark 2' },
+      { tag: 'lt2',      name: 'Light 2' },
+      { tag: 'accent1',  name: 'Accent 1' },
+      { tag: 'accent2',  name: 'Accent 2' },
+      { tag: 'accent3',  name: 'Accent 3' },
+      { tag: 'accent4',  name: 'Accent 4' },
+      { tag: 'accent5',  name: 'Accent 5' },
+      { tag: 'accent6',  name: 'Accent 6' },
+      { tag: 'hlink',    name: 'Hyperlink' },
+      { tag: 'folHlink', name: 'Followed Hyperlink' },
+    ];
+
+    const result = [];
+    for (const { tag, name } of TAGS) {
+      const el = scheme.getElementsByTagNameNS(ns, tag)[0];
+      if (!el) continue;
+      const srgb = el.getElementsByTagNameNS(ns, 'srgbClr')[0];
+      const sys  = el.getElementsByTagNameNS(ns, 'sysClr')[0];
+      const hex  = srgb ? normalizeHex(srgb.getAttribute('val'))
+                 : sys  ? normalizeHex(sys.getAttribute('lastClr'))
+                 : null;
+      if (hex) result.push({ hex, name });
+    }
+
     if (result.length >= 2) {
-      /* Deduplicate while preserving order */
       const seen = new Set();
       return result.filter((c) => {
         const key = c.hex.toUpperCase();
@@ -531,18 +585,7 @@ function getThemeColors() {
   } catch (err) {
     console.warn('[ShapR] Could not read theme colors:', err.message);
   }
-
   return DEFAULT_COLORS;
-}
-
-/** Convert an rgb(r, g, b) string to #RRGGBB */
-function rgbToHex(rgb) {
-  const m = String(rgb).match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-  if (!m) return null;
-  const r = parseInt(m[1], 10);
-  const g = parseInt(m[2], 10);
-  const b = parseInt(m[3], 10);
-  return '#' + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1).toUpperCase();
 }
 
 /** Ensure hex string is #RRGGBB */
@@ -642,25 +685,22 @@ function applyColorToSvg(svgString, color) {
 }
 
 async function insertIcon(icon) {
-  const size     = state.selectedSize;
+  const ptSize   = state.selectedSize;           // already in points via SIZE_MAP
   const color    = state.selectedColor;
-  const svgRaw   = buildInsertSvg(icon, color, size);
+  const renderPx = 256;                          // high-res raster for crisp output
+  const svgRaw   = buildInsertSvg(icon, color, renderPx);
   const svgFinal = applyColorToSvg(svgRaw, color);
 
-  // Dimensions in points (1px ≈ 0.75pt, Office uses points/EMUs)
-  // Office.js addSvg left/top/width/height are in points
-  const ptSize = Math.round(size * 0.75);
-
   try {
-    // ── Primary: Office.context.document.setSelectedDataAsync ────
-    // Works in both PowerPoint Desktop and Online — insert as PNG image
     if (
       typeof Office !== 'undefined' &&
       Office.context?.document?.setSelectedDataAsync
     ) {
-      const dataUrl = await svgToDataUrl(svgFinal, size, size);
-      await setSelectedDataAsync(dataUrl);
-      showToast(`Inserted "${icon.name}" (${size}px)`, 'success');
+      const dataUrl = await svgToDataUrl(svgFinal, renderPx, renderPx);
+      await setSelectedDataAsync(dataUrl, ptSize);
+
+      const cmLabel = { [28.35]: '1 cm', [85.04]: '3 cm', [170.08]: '6 cm' }[ptSize] || `${Math.round(ptSize)}pt`;
+      showToast(`Inserted "${icon.name}" (${cmLabel})`, 'success');
       return;
     }
 
@@ -686,7 +726,7 @@ function svgToDataUrl(svgString, width, height) {
     const blob  = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
     const url   = URL.createObjectURL(blob);
     const img   = new Image();
-    const scale = 64;  // 8x for crisp presentation-quality output
+    const scale = 2;   // 2x for crisp output (256px → 512px canvas)
 
     img.onload = () => {
       const canvas = document.createElement('canvas');
@@ -711,12 +751,16 @@ function svgToDataUrl(svgString, width, height) {
 /**
  * Wrap Office setSelectedDataAsync in a Promise
  */
-function setSelectedDataAsync(dataUrl) {
+function setSelectedDataAsync(dataUrl, ptSize) {
   return new Promise((resolve, reject) => {
     const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
     Office.context.document.setSelectedDataAsync(
       base64,
-      { coercionType: Office.CoercionType.Image },
+      {
+        coercionType: Office.CoercionType.Image,
+        imageWidth: ptSize,
+        imageHeight: ptSize,
+      },
       (result) => {
         if (result.status === Office.AsyncResultStatus.Succeeded) {
           resolve();
