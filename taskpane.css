@@ -652,6 +652,17 @@ body {
   100% { background: var(--bg-card); border-color: var(--border-card); box-shadow: var(--shadow-card); }
 }
 
+/* When white is the active icon colour, give cards a navy bg so icons are visible */
+#grid-viewport.white-color-selected .icon-card {
+  background: #0B2B45;
+  border-color: rgba(255,255,255,0.12);
+}
+
+#grid-viewport.white-color-selected .icon-card:hover {
+  background: #163d5e;
+  border-color: rgba(48,165,191,0.40);
+}
+
 /* SVG inside the card */
 .icon-card svg {
   display: block;

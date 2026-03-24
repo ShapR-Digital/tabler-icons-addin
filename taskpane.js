@@ -416,6 +416,11 @@ function buildPreviewSvg(icon, color, size) {
 
 function selectColor(hex) {
   state.selectedColor = hex;
+  // When white is selected the icon preview is invisible on a light card bg — swap to navy
+  const viewport = els.gridViewport();
+  if (viewport) {
+    viewport.classList.toggle('white-color-selected', hex.toUpperCase() === '#FFFFFF');
+  }
   // Refresh the visible cards' SVG previews with the new colour
   refreshCardPreviews();
 }
