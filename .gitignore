@@ -1,0 +1,9 @@
+node_modules/
+.office-addin-dev-certs/
+convert-icons.js
+share/
+server.js
+package.json
+package-lock.json
+manifest.xml
+.claude/

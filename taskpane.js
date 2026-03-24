@@ -483,57 +483,116 @@ async function initColorSwatches() {
   syncHexInput(colors[0].hex);
 }
 
-/** Theme color names in PowerPoint order */
-const THEME_COLOR_NAMES = [
-  'Dark 1', 'Light 1', 'Dark 2', 'Light 2',
-  'Accent 1', 'Accent 2', 'Accent 3', 'Accent 4', 'Accent 5', 'Accent 6',
-  'Hyperlink', 'Followed Hyperlink',
-];
 
 /**
- * Read colours from the active presentation's slide theme via PowerPoint.run,
- * falling back to defaults.
+ * Read colours from the active presentation's OOXML theme file.
+ * Opens the PPTX as a ZIP via JSZip, parses ppt/theme/theme1.xml,
+ * and extracts the <a:clrScheme> entries.  Falls back to DEFAULT_COLORS
+ * when Office or JSZip is unavailable.
  */
 async function getThemeColors() {
-  if (state.officeAvailable && typeof PowerPoint !== 'undefined' && PowerPoint.run) {
-    try {
-      const colors = await PowerPoint.run(async (context) => {
-        const slide = context.presentation.slides.getItemAt(0);
-        const theme = slide.slideMaster.theme;
-        const fmt   = theme.format;
-        fmt.load('fontScheme,colorScheme');
-        await context.sync();
+  if (!state.officeAvailable || typeof JSZip === 'undefined') return DEFAULT_COLORS;
 
-        const scheme = fmt.colorScheme;
-        const result = [];
-        for (let i = 0; i < scheme.count && i < THEME_COLOR_NAMES.length; i++) {
-          const entry = scheme.getItemAt(i);
-          entry.load('color');
-        }
-        await context.sync();
+  try {
+    /* ── 1. Get PPTX bytes via the Common API ── */
+    const fileBytes = await new Promise((resolve, reject) => {
+      Office.context.document.getFileAsync(
+        Office.FileType.Compressed,
+        { sliceSize: 65536 },
+        async (result) => {
+          if (result.status !== Office.AsyncResultStatus.Succeeded) {
+            return reject(new Error(result.error.message));
+          }
+          const file       = result.value;
+          const sliceCount = file.sliceCount;
+          const parts      = [];
 
-        for (let i = 0; i < scheme.count && i < THEME_COLOR_NAMES.length; i++) {
-          const entry = scheme.getItemAt(i);
-          const hex = normalizeHex(entry.color);
-          result.push({ hex, name: THEME_COLOR_NAMES[i] });
-        }
-        return result;
-      });
+          for (let i = 0; i < sliceCount; i++) {
+            const slice = await new Promise((res, rej) => {
+              file.getSliceAsync(i, (sr) => {
+                if (sr.status === Office.AsyncResultStatus.Succeeded) res(sr.value.data);
+                else rej(new Error(sr.error.message));
+              });
+            });
+            parts.push(slice);
+          }
+          file.closeAsync();
 
-      if (colors.length >= 2) {
-        // Deduplicate
-        const seen   = new Set();
-        return colors.filter((c) => {
-          const key = c.hex.toUpperCase();
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
-      }
-    } catch (err) {
-      console.warn('[ShapR] Could not read theme colors:', err.message);
+          /* Concatenate Uint8Arrays */
+          const total = parts.reduce((n, p) => n + p.byteLength, 0);
+          const buf   = new Uint8Array(total);
+          let offset  = 0;
+          for (const p of parts) {
+            buf.set(new Uint8Array(p), offset);
+            offset += p.byteLength;
+          }
+          resolve(buf);
+        },
+      );
+    });
+
+    /* ── 2. Unzip and find the theme XML ── */
+    const zip = await JSZip.loadAsync(fileBytes);
+    const themeFile = zip.file('ppt/theme/theme1.xml');
+    if (!themeFile) return DEFAULT_COLORS;
+
+    const themeXml = await themeFile.async('text');
+
+    /* ── 3. Parse <a:clrScheme> ── */
+    const parser  = new DOMParser();
+    const doc     = parser.parseFromString(themeXml, 'application/xml');
+    const ns      = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+
+    /* Tag → friendly name mapping (same order PowerPoint uses) */
+    const COLOR_TAGS = [
+      { tag: 'dk1',     name: 'Dark 1' },
+      { tag: 'lt1',     name: 'Light 1' },
+      { tag: 'dk2',     name: 'Dark 2' },
+      { tag: 'lt2',     name: 'Light 2' },
+      { tag: 'accent1', name: 'Accent 1' },
+      { tag: 'accent2', name: 'Accent 2' },
+      { tag: 'accent3', name: 'Accent 3' },
+      { tag: 'accent4', name: 'Accent 4' },
+      { tag: 'accent5', name: 'Accent 5' },
+      { tag: 'accent6', name: 'Accent 6' },
+      { tag: 'hlink',   name: 'Hyperlink' },
+      { tag: 'folHlink', name: 'Followed Hyperlink' },
+    ];
+
+    const scheme = doc.getElementsByTagNameNS(ns, 'clrScheme')[0];
+    if (!scheme) return DEFAULT_COLORS;
+
+    const result = [];
+    for (const { tag, name } of COLOR_TAGS) {
+      const el = scheme.getElementsByTagNameNS(ns, tag)[0];
+      if (!el) continue;
+
+      /* Colour can be <a:srgbClr val="4472C4"/> or <a:sysClr lastClr="000000"/> */
+      const srgb = el.getElementsByTagNameNS(ns, 'srgbClr')[0];
+      const sys  = el.getElementsByTagNameNS(ns, 'sysClr')[0];
+      const hex  = srgb
+        ? normalizeHex(srgb.getAttribute('val'))
+        : sys
+          ? normalizeHex(sys.getAttribute('lastClr'))
+          : null;
+
+      if (hex) result.push({ hex, name });
     }
+
+    if (result.length >= 2) {
+      /* Deduplicate while preserving order */
+      const seen = new Set();
+      return result.filter((c) => {
+        const key = c.hex.toUpperCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+  } catch (err) {
+    console.warn('[ShapR] Could not read theme colors:', err.message);
   }
+
   return DEFAULT_COLORS;
 }
 
