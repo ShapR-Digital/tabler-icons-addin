@@ -43,20 +43,8 @@ const DEFAULT_COLORS = [
   { hex: '#FFFFFF', name: 'White' },
 ];
 
-/**
- * OfficeThemes.css class names to probe for document theme colours.
- * Office.js rewrites these CSS rules at runtime to match the active theme.
- */
-const THEME_COLOR_PROBES = [
-  { className: 'office-contentAccent1-color', name: 'Accent 1' },
-  { className: 'office-contentAccent2-color', name: 'Accent 2' },
-  { className: 'office-contentAccent3-color', name: 'Accent 3' },
-  { className: 'office-contentAccent4-color', name: 'Accent 4' },
-  { className: 'office-contentAccent5-color', name: 'Accent 5' },
-  { className: 'office-contentAccent6-color', name: 'Accent 6' },
-  { className: 'office-docTheme-primary-fontColor',   name: 'Text Primary' },
-  { className: 'office-docTheme-secondary-fontColor',  name: 'Text Secondary' },
-];
+/** How often to re-check the document theme (ms) */
+const THEME_POLL_INTERVAL = 20_000;
 
 /** Approx card height including gap — used for virtual scroll row math */
 const CARD_SIZE   = 72;
@@ -100,6 +88,12 @@ const state = {
 
   /** Toast auto-hide timer */
   toastTimer: null,
+
+  /** Theme polling timer */
+  themeTimer: null,
+
+  /** Cached theme XML for change detection */
+  lastThemeXml: null,
 
   /** Whether icons have loaded */
   loaded: false,
@@ -169,10 +163,13 @@ function initOffice() {
 async function startApp() {
   // Use the presentation's theme colours when running in PowerPoint;
   // fall back to ShapR brand colours otherwise.
-  const themeColors = state.officeAvailable ? extractThemeColors() : null;
+  const themeColors = state.officeAvailable ? await extractThemeColors() : null;
   initColorSwatches(themeColors || DEFAULT_COLORS);
   bindControls();
   loadIcons();
+
+  // Poll for theme changes so swatches update when the user switches themes
+  if (state.officeAvailable) startThemePolling();
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -604,61 +601,239 @@ function isLightColor(hex) {
   return (r * 0.299 + g * 0.587 + b * 0.114) > 186;
 }
 
-/**
- * Convert a CSS computed colour string (e.g. "rgb(48, 165, 191)") to "#RRGGBB".
- * Returns null if the string cannot be parsed.
- */
-function rgbToHex(rgbStr) {
-  const match = rgbStr.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-  if (!match) return null;
-  const [, r, g, b] = match;
-  return '#' + [r, g, b].map((v) => Number(v).toString(16).padStart(2, '0')).join('').toUpperCase();
-}
+/* ═══════════════════════════════════════════════════════════════════
+   THEME COLOUR EXTRACTION (OOXML)
+   Reads ppt/theme/theme1.xml directly from the in-memory PPTX via
+   getFileAsync. Works for task-pane add-ins (OfficeThemes.css only
+   injects document theme colours reliably for content add-ins).
+═══════════════════════════════════════════════════════════════════ */
 
 /**
- * Read document theme colours by probing OfficeThemes.css computed styles.
- * Creates temporary hidden <span> elements, reads getComputedStyle().color,
- * converts to hex, deduplicates, appends Black/White, and returns
- * an array of { hex, name } or null if extraction fails.
+ * Read the PPTX from memory, extract theme1.xml, and return an array
+ * of { hex, name } colour objects.  Returns null on any failure.
  */
-function extractThemeColors() {
+async function extractThemeColors() {
   try {
-    const container = document.createElement('div');
-    container.style.cssText = 'position:absolute;left:-9999px;top:-9999px;visibility:hidden;pointer-events:none;';
-    document.body.appendChild(container);
+    const data     = await getFileData();
+    const themeXml = await extractFileFromZip(data, 'ppt/theme/theme1.xml');
 
-    const colors  = [];
-    const seenHex = new Set();
+    // Cache for change-detection in the poller
+    state.lastThemeXml = themeXml;
 
-    for (const probe of THEME_COLOR_PROBES) {
-      const span = document.createElement('span');
-      span.className = probe.className;
-      container.appendChild(span);
-
-      const computed = window.getComputedStyle(span).color;
-      const hex      = rgbToHex(computed);
-
-      if (hex && !seenHex.has(hex)) {
-        seenHex.add(hex);
-        colors.push({ hex, name: probe.name });
-      }
-    }
-
-    document.body.removeChild(container);
-
-    // Always offer Black and White
-    if (!seenHex.has('#000000')) colors.push({ hex: '#000000', name: 'Black' });
-    if (!seenHex.has('#FFFFFF')) colors.push({ hex: '#FFFFFF', name: 'White' });
-
-    // Need at least one non-BW colour to consider the extraction valid
-    const nonBW = colors.filter((c) => c.hex !== '#000000' && c.hex !== '#FFFFFF');
-    if (nonBW.length < 1) return null;
-
-    return colors;
+    return parseThemeColors(themeXml);
   } catch (err) {
     console.warn('[ShapR] Theme colour extraction failed:', err);
     return null;
   }
+}
+
+/**
+ * Periodically re-read the theme and update swatches if the colour
+ * scheme changed (e.g. user picked a different theme).
+ */
+function startThemePolling() {
+  state.themeTimer = setInterval(async () => {
+    try {
+      const data     = await getFileData();
+      const themeXml = await extractFileFromZip(data, 'ppt/theme/theme1.xml');
+
+      if (themeXml === state.lastThemeXml) return;   // no change
+      state.lastThemeXml = themeXml;
+
+      const colors = parseThemeColors(themeXml);
+      if (colors) {
+        initColorSwatches(colors);
+        console.log('[ShapR] Theme colours updated');
+      }
+    } catch (_) { /* ignore polling errors */ }
+  }, THEME_POLL_INTERVAL);
+}
+
+/* ── getFileAsync wrapper ─────────────────────────────────────── */
+
+/**
+ * Read the entire PPTX (in-memory representation) as a Uint8Array.
+ * Uses Office.context.document.getFileAsync with Compressed type.
+ */
+function getFileData() {
+  return new Promise((resolve, reject) => {
+    Office.context.document.getFileAsync(
+      Office.FileType.Compressed,
+      { sliceSize: 65536 },
+      (result) => {
+        if (result.status !== Office.AsyncResultStatus.Succeeded) {
+          reject(new Error(result.error?.message || 'getFileAsync failed'));
+          return;
+        }
+        const file   = result.value;
+        const slices = [];
+        let received = 0;
+
+        function readSlice(idx) {
+          file.getSliceAsync(idx, (sr) => {
+            if (sr.status !== Office.AsyncResultStatus.Succeeded) {
+              file.closeAsync();
+              reject(new Error(sr.error?.message || 'getSliceAsync failed'));
+              return;
+            }
+            slices[idx] = toUint8Array(sr.value.data);
+            received++;
+            if (received === file.sliceCount) {
+              file.closeAsync();
+              resolve(concatBuffers(slices));
+            } else {
+              readSlice(idx + 1);
+            }
+          });
+        }
+
+        if (file.sliceCount > 0) readSlice(0);
+        else { file.closeAsync(); reject(new Error('Empty file')); }
+      }
+    );
+  });
+}
+
+/** Normalise slice data (may be Uint8Array, ArrayBuffer, or number[]) */
+function toUint8Array(data) {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (Array.isArray(data))         return new Uint8Array(data);
+  throw new Error('Unexpected slice data type');
+}
+
+function concatBuffers(arrays) {
+  const total = arrays.reduce((s, a) => s + a.length, 0);
+  const out   = new Uint8Array(total);
+  let off     = 0;
+  for (const a of arrays) { out.set(a, off); off += a.length; }
+  return out;
+}
+
+/* ── Minimal ZIP reader ───────────────────────────────────────── */
+
+/**
+ * Extract a single file from a ZIP (Uint8Array) by name.
+ * Supports Store (method 0) and Deflate (method 8) entries.
+ */
+async function extractFileFromZip(zip, filename) {
+  const view = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
+
+  // Locate End-of-Central-Directory record (last 22+ bytes)
+  let eocd = -1;
+  for (let i = zip.length - 22; i >= Math.max(0, zip.length - 65557); i--) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd === -1) throw new Error('Not a valid ZIP');
+
+  const cdOffset  = view.getUint32(eocd + 16, true);
+  const cdEntries = view.getUint16(eocd + 10, true);
+
+  let pos = cdOffset;
+  for (let i = 0; i < cdEntries; i++) {
+    if (view.getUint32(pos, true) !== 0x02014b50) break;
+
+    const method     = view.getUint16(pos + 10, true);
+    const compSize   = view.getUint32(pos + 20, true);
+    const nameLen    = view.getUint16(pos + 28, true);
+    const extraLen   = view.getUint16(pos + 30, true);
+    const commentLen = view.getUint16(pos + 32, true);
+    const localOff   = view.getUint32(pos + 42, true);
+
+    const name = new TextDecoder().decode(zip.subarray(pos + 46, pos + 46 + nameLen));
+
+    if (name === filename) {
+      // Jump to the Local File Header to read the actual data
+      const lNameLen  = view.getUint16(localOff + 26, true);
+      const lExtraLen = view.getUint16(localOff + 28, true);
+      const dataStart = localOff + 30 + lNameLen + lExtraLen;
+      const raw       = zip.subarray(dataStart, dataStart + compSize);
+
+      if (method === 0) return new TextDecoder().decode(raw);          // Stored
+      if (method === 8) return await inflateRaw(raw);                  // Deflate
+      throw new Error(`Unsupported ZIP method ${method}`);
+    }
+
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+  throw new Error(`${filename} not found in ZIP`);
+}
+
+/** Decompress raw-deflate data using the browser's DecompressionStream. */
+async function inflateRaw(compressed) {
+  const ds     = new DecompressionStream('deflate-raw');
+  const writer = ds.writable.getWriter();
+  writer.write(compressed);
+  writer.close();
+
+  const reader = ds.readable.getReader();
+  const chunks = [];
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const total = chunks.reduce((s, c) => s + c.length, 0);
+  const out   = new Uint8Array(total);
+  let off     = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return new TextDecoder().decode(out);
+}
+
+/* ── Theme XML parser ─────────────────────────────────────────── */
+
+/**
+ * Parse ppt/theme/theme1.xml and return an array of { hex, name }.
+ * Reads the <a:clrScheme> for accent1–6 and dk1/dk2 text colours.
+ */
+function parseThemeColors(xmlString) {
+  const NS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+  const doc = new DOMParser().parseFromString(xmlString, 'application/xml');
+  const clr = doc.getElementsByTagNameNS(NS, 'clrScheme')[0];
+  if (!clr) return null;
+
+  const entries = [
+    { tag: 'accent1', name: 'Accent 1' },
+    { tag: 'accent2', name: 'Accent 2' },
+    { tag: 'accent3', name: 'Accent 3' },
+    { tag: 'accent4', name: 'Accent 4' },
+    { tag: 'accent5', name: 'Accent 5' },
+    { tag: 'accent6', name: 'Accent 6' },
+    { tag: 'dk1',     name: 'Dark 1' },
+    { tag: 'dk2',     name: 'Dark 2' },
+  ];
+
+  const colors  = [];
+  const seenHex = new Set();
+
+  for (const { tag, name } of entries) {
+    const el = clr.getElementsByTagNameNS(NS, tag)[0];
+    if (!el) continue;
+
+    // <a:srgbClr val="4472C4"/> — explicit hex
+    const srgb = el.getElementsByTagNameNS(NS, 'srgbClr')[0];
+    if (srgb) {
+      const hex = '#' + srgb.getAttribute('val').toUpperCase();
+      if (!seenHex.has(hex)) { seenHex.add(hex); colors.push({ hex, name }); }
+      continue;
+    }
+
+    // <a:sysClr val="windowText" lastClr="000000"/> — system colour
+    const sys = el.getElementsByTagNameNS(NS, 'sysClr')[0];
+    if (sys) {
+      const last = sys.getAttribute('lastClr');
+      if (last) {
+        const hex = '#' + last.toUpperCase();
+        if (!seenHex.has(hex)) { seenHex.add(hex); colors.push({ hex, name }); }
+      }
+    }
+  }
+
+  // Always offer Black and White
+  if (!seenHex.has('#000000')) colors.push({ hex: '#000000', name: 'Black' });
+  if (!seenHex.has('#FFFFFF')) colors.push({ hex: '#FFFFFF', name: 'White' });
+
+  return colors.length > 2 ? colors : null;
 }
 
 /** Keep the hex text input and native picker in sync */
