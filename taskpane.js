@@ -122,6 +122,7 @@ const els = {
   toast:         () => document.getElementById('toast'),
   colorSwatches: () => document.getElementById('color-swatches'),
   colorPicker:   () => document.getElementById('color-picker'),
+  refreshTheme:  () => document.getElementById('refresh-theme-btn'),
   hexInput:      () => document.getElementById('hex-input'),
 };
 
@@ -168,8 +169,7 @@ async function startApp() {
   bindControls();
   loadIcons();
 
-  // Poll for theme changes so swatches update when the user switches themes
-  if (state.officeAvailable) startThemePolling();
+  // Theme refresh is handled by the explicit refresh button in the UI.
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1075,6 +1075,20 @@ function bindControls() {
       // Re-run search with the current query text so both filters apply
       searchIcons(els.searchInput().value.trim());
     });
+  }
+
+  // Refresh-theme button — only visible when running inside PowerPoint
+  const refreshBtn = els.refreshTheme();
+  if (refreshBtn) {
+    if (state.officeAvailable) {
+      refreshBtn.classList.remove('hidden');
+      refreshBtn.addEventListener('click', async () => {
+        refreshBtn.classList.add('spinning');
+        const colors = await extractThemeColors();
+        if (colors) initColorSwatches(colors);
+        setTimeout(() => refreshBtn.classList.remove('spinning'), 600);
+      });
+    }
   }
 
   // Native colour picker (the rainbow swatch)

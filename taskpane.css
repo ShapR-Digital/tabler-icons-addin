@@ -345,6 +345,37 @@ body {
   filter: drop-shadow(0 0 1px rgba(0,0,0,0.5));
 }
 
+/* Refresh theme button */
+.refresh-theme-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  padding: 0;
+  transition: color var(--transition-fast), background var(--transition-fast), transform 0.3s ease;
+}
+
+.refresh-theme-btn:hover {
+  color: var(--color-teal);
+  background: rgba(48,165,191,0.10);
+}
+
+.refresh-theme-btn.spinning svg {
+  animation: spin 0.6s ease;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
 /* Hex input row */
 .option-row--hex {
   margin-top: -2px;
