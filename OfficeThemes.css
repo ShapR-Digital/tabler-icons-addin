@@ -1,0 +1,12 @@
+/* Office.js rewrites these rules at runtime to match the document theme.
+   File MUST be named exactly "OfficeThemes.css" for injection to work.
+   Defaults = ShapR brand colors (used when running outside Office). */
+
+.office-docTheme-primary-fontColor   { color: #0B2B45; }
+.office-docTheme-secondary-fontColor { color: #5A7080; }
+.office-contentAccent1-color         { color: #30A5BF; }
+.office-contentAccent2-color         { color: #185359; }
+.office-contentAccent3-color         { color: #F2BE22; }
+.office-contentAccent4-color         { color: #D8256A; }
+.office-contentAccent5-color         { color: #0B2B45; }
+.office-contentAccent6-color         { color: #8FA3B1; }

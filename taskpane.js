@@ -43,6 +43,21 @@ const DEFAULT_COLORS = [
   { hex: '#FFFFFF', name: 'White' },
 ];
 
+/**
+ * OfficeThemes.css class names to probe for document theme colours.
+ * Office.js rewrites these CSS rules at runtime to match the active theme.
+ */
+const THEME_COLOR_PROBES = [
+  { className: 'office-contentAccent1-color', name: 'Accent 1' },
+  { className: 'office-contentAccent2-color', name: 'Accent 2' },
+  { className: 'office-contentAccent3-color', name: 'Accent 3' },
+  { className: 'office-contentAccent4-color', name: 'Accent 4' },
+  { className: 'office-contentAccent5-color', name: 'Accent 5' },
+  { className: 'office-contentAccent6-color', name: 'Accent 6' },
+  { className: 'office-docTheme-primary-fontColor',   name: 'Text Primary' },
+  { className: 'office-docTheme-secondary-fontColor',  name: 'Text Secondary' },
+];
+
 /** Approx card height including gap — used for virtual scroll row math */
 const CARD_SIZE   = 72;
 const CARD_GAP    = 6;
@@ -152,7 +167,10 @@ function initOffice() {
 ═══════════════════════════════════════════════════════════════════ */
 
 async function startApp() {
-  initColorSwatches(DEFAULT_COLORS);
+  // Use the presentation's theme colours when running in PowerPoint;
+  // fall back to ShapR brand colours otherwise.
+  const themeColors = state.officeAvailable ? extractThemeColors() : null;
+  initColorSwatches(themeColors || DEFAULT_COLORS);
   bindControls();
   loadIcons();
 }
@@ -584,6 +602,63 @@ function isLightColor(hex) {
   const g = parseInt(h.substring(2, 4), 16);
   const b = parseInt(h.substring(4, 6), 16);
   return (r * 0.299 + g * 0.587 + b * 0.114) > 186;
+}
+
+/**
+ * Convert a CSS computed colour string (e.g. "rgb(48, 165, 191)") to "#RRGGBB".
+ * Returns null if the string cannot be parsed.
+ */
+function rgbToHex(rgbStr) {
+  const match = rgbStr.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+  if (!match) return null;
+  const [, r, g, b] = match;
+  return '#' + [r, g, b].map((v) => Number(v).toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
+/**
+ * Read document theme colours by probing OfficeThemes.css computed styles.
+ * Creates temporary hidden <span> elements, reads getComputedStyle().color,
+ * converts to hex, deduplicates, appends Black/White, and returns
+ * an array of { hex, name } or null if extraction fails.
+ */
+function extractThemeColors() {
+  try {
+    const container = document.createElement('div');
+    container.style.cssText = 'position:absolute;left:-9999px;top:-9999px;visibility:hidden;pointer-events:none;';
+    document.body.appendChild(container);
+
+    const colors  = [];
+    const seenHex = new Set();
+
+    for (const probe of THEME_COLOR_PROBES) {
+      const span = document.createElement('span');
+      span.className = probe.className;
+      container.appendChild(span);
+
+      const computed = window.getComputedStyle(span).color;
+      const hex      = rgbToHex(computed);
+
+      if (hex && !seenHex.has(hex)) {
+        seenHex.add(hex);
+        colors.push({ hex, name: probe.name });
+      }
+    }
+
+    document.body.removeChild(container);
+
+    // Always offer Black and White
+    if (!seenHex.has('#000000')) colors.push({ hex: '#000000', name: 'Black' });
+    if (!seenHex.has('#FFFFFF')) colors.push({ hex: '#FFFFFF', name: 'White' });
+
+    // Need at least one non-BW colour to consider the extraction valid
+    const nonBW = colors.filter((c) => c.hex !== '#000000' && c.hex !== '#FFFFFF');
+    if (nonBW.length < 1) return null;
+
+    return colors;
+  } catch (err) {
+    console.warn('[ShapR] Theme colour extraction failed:', err);
+    return null;
+  }
 }
 
 /** Keep the hex text input and native picker in sync */
