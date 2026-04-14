@@ -2,10 +2,10 @@
  * ShapR Tabler Icons — PowerPoint Add-in
  *
  * Architecture:
- *  - Fetches Tabler outline sprite SVG (one request, all icons)
- *  - Parses <symbol> elements to build icon registry
+ *  - Resolves latest @tabler/icons version from npm registry
+ *  - Fetches icons.json (metadata/tags/categories) + tabler-nodes-outline.json (path data)
  *  - Virtual scroll renders only visible cards (~100 at a time)
- *  - Debounced search filters the registry
+ *  - Debounced search filters by name + tags; dropdown filters by category
  *  - Office.js inserts coloured SVG into active slide
  */
 
@@ -13,9 +13,16 @@
    CONSTANTS & CONFIG
 ═══════════════════════════════════════════════════════════════════ */
 
-const SPRITE_URLS = [
-  'https://cdn.jsdelivr.net/npm/@tabler/icons@latest/tabler-sprite.svg',
-  'https://unpkg.com/@tabler/icons@latest/tabler-sprite.svg',
+/** npm registry endpoint to resolve the true latest version */
+const NPM_LATEST_URL = 'https://registry.npmjs.org/@tabler/icons/latest';
+
+/** Known-good fallback version if the registry is unreachable */
+const FALLBACK_VERSION = '3.41.1';
+
+/** CDN base URLs (tried in order) */
+const CDN_BASES = [
+  'https://cdn.jsdelivr.net/npm/@tabler/icons',
+  'https://unpkg.com/@tabler/icons',
 ];
 
 /** Insertion sizes in points (1 cm ≈ 28.35 pt) */
@@ -49,7 +56,7 @@ const OVERSCAN_ROWS = 3;
 ═══════════════════════════════════════════════════════════════════ */
 
 const state = {
-  /** Full list of parsed icon objects: { name, viewBox, pathData } */
+  /** Full list of parsed icon objects: { name, viewBox, pathData, tags, category } */
   allIcons: [],
 
   /** Currently displayed subset (after search filter) */
@@ -69,6 +76,9 @@ const state = {
 
   /** Scroll position cache */
   lastScrollTop: 0,
+
+  /** Active category filter (empty string = all) */
+  selectedCategory: '',
 
   /** Debounce timer handle */
   searchTimer: null,
@@ -98,6 +108,7 @@ const els = {
   iconCount:     () => document.getElementById('icon-count'),
   resultCount:   () => document.getElementById('result-count'),
   sizeDisplay:   () => document.getElementById('size-display'),
+  categoryFilter: () => document.getElementById('category-filter'),
   retryBtn:      () => document.getElementById('retry-btn'),
   toast:         () => document.getElementById('toast'),
   colorSwatches: () => document.getElementById('color-swatches'),
@@ -147,85 +158,118 @@ async function startApp() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   ICON LOADING — Sprite approach
-   One request fetches ALL icons as a single SVG sprite.
-   We parse <symbol> elements to extract viewBox + path data.
+   ICON LOADING — JSON approach (Tabler Icons v3+)
+   Two requests: icons.json (metadata + tags + categories) and
+   tabler-nodes-outline.json (SVG path data per icon).
+   Version is resolved dynamically from the npm registry so we always
+   get the latest icons without relying on CDN @latest caching.
 ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Resolve the true latest @tabler/icons version from the npm registry.
+ * Falls back to FALLBACK_VERSION if the registry is unreachable.
+ */
+async function resolveLatestVersion() {
+  try {
+    const res = await fetch(NPM_LATEST_URL);
+    if (res.ok) {
+      const { version } = await res.json();
+      if (version) return version;
+    }
+  } catch (_) { /* ignore — use fallback */ }
+  return FALLBACK_VERSION;
+}
+
+/**
+ * Fetch a file from the Tabler CDN, trying each CDN_BASES entry in order.
+ */
+async function fetchFromCdn(path, version) {
+  let lastErr = null;
+  for (const base of CDN_BASES) {
+    try {
+      const res = await fetch(`${base}@${version}/${path}`);
+      if (res.ok) return res;
+      lastErr = new Error(`HTTP ${res.status} from ${base}`);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error(`Failed to fetch ${path}`);
+}
 
 async function loadIcons() {
   showState('loading');
 
-  let spriteText = null;
-  let lastError  = null;
-
-  for (const url of SPRITE_URLS) {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      spriteText = await res.text();
-      break;
-    } catch (err) {
-      lastError = err;
-      console.warn(`[ShapR] Sprite fetch failed from ${url}:`, err.message);
-    }
-  }
-
-  if (!spriteText) {
-    showError(`Could not fetch the Tabler Icons sprite from CDN. Check your internet connection.\n(${lastError?.message || 'Unknown error'})`);
-    return;
-  }
-
   try {
-    const icons = parseSprite(spriteText);
-    if (icons.length === 0) throw new Error('No icons found in sprite');
+    const version = await resolveLatestVersion();
+    console.log(`[ShapR] Loading Tabler Icons v${version}`);
 
-    state.allIcons     = icons;
+    const [metaRes, nodesRes] = await Promise.all([
+      fetchFromCdn('icons.json', version),
+      fetchFromCdn('tabler-nodes-outline.json', version),
+    ]);
+
+    const [meta, nodes] = await Promise.all([
+      metaRes.json(),
+      nodesRes.json(),
+    ]);
+
+    const icons = buildIconRegistry(meta, nodes);
+    if (icons.length === 0) throw new Error('No icons found in data');
+
+    state.allIcons      = icons;
     state.filteredIcons = icons;
-    state.loaded       = true;
+    state.loaded        = true;
 
+    populateCategoryFilter(icons);
     updateIconCount(icons.length, icons.length);
     showState('grid');
     recalcColumns();
     renderGrid();
 
   } catch (err) {
-    console.error('[ShapR] Sprite parse error:', err);
-    showError(`Failed to parse icon data: ${err.message}`);
+    console.error('[ShapR] Load error:', err);
+    showError(`Could not load Tabler Icons from CDN. Check your internet connection.\n(${err.message})`);
   }
 }
 
 /**
- * Parse the SVG sprite into a flat icon array.
- * Each <symbol id="tabler-{name}"> contains the icon paths.
+ * Merge icons.json (metadata) with tabler-nodes-outline.json (path data)
+ * into a flat array of icon objects.
  *
- * @param {string} spriteText  Raw SVG text
- * @returns {{ name:string, viewBox:string, pathData:string }[]}
+ * @param {Object} meta   icons.json — { [name]: { category, tags, ... } }
+ * @param {Object} nodes  tabler-nodes-outline.json — { [name]: [[tag, attrs], ...] }
+ * @returns {{ name, viewBox, pathData, tags, category }[]}
  */
-function parseSprite(spriteText) {
-  // Use DOMParser — fast and reliable in modern browsers
-  const parser = new DOMParser();
-  const doc    = parser.parseFromString(spriteText, 'image/svg+xml');
+function buildIconRegistry(meta, nodes) {
+  const icons = [];
 
-  const symbols = doc.querySelectorAll('symbol[id^="tabler-"]');
-  const icons   = [];
+  for (const [name, nodeList] of Object.entries(nodes)) {
+    const iconMeta = meta[name] || {};
+    icons.push({
+      name,
+      viewBox:  '0 0 24 24',
+      pathData: nodesToPathData(nodeList),
+      tags:     Array.isArray(iconMeta.tags) ? iconMeta.tags.map(String) : [],
+      category: iconMeta.category || '',
+    });
+  }
 
-  symbols.forEach((sym) => {
-    const id   = sym.getAttribute('id');          // e.g. "tabler-home"
-    const name = id.replace(/^tabler-/, '');       // e.g. "home"
-
-    // Skip variant suffixes like -filled if present (keep outline only)
-    if (name.endsWith('-filled')) return;
-
-    const viewBox  = sym.getAttribute('viewBox') || '0 0 24 24';
-    const pathData = sym.innerHTML.trim();         // inner SVG elements
-
-    icons.push({ name, viewBox, pathData });
-  });
-
-  // Sort alphabetically
   icons.sort((a, b) => a.name.localeCompare(b.name));
-
   return icons;
+}
+
+/**
+ * Convert a node list from tabler-nodes-outline.json into an SVG innerHTML string.
+ * Each node is [tagName, attrsObject], e.g. ["path", { "d": "M4 4h16..." }]
+ */
+function nodesToPathData(nodeList) {
+  return nodeList.map(([tag, attrs]) => {
+    const attrStr = Object.entries(attrs)
+      .map(([k, v]) => `${k}="${v}"`)
+      .join(' ');
+    return `<${tag} ${attrStr}/>`;
+  }).join('');
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -245,14 +289,20 @@ function onSearchInput(e) {
 function searchIcons(query) {
   if (!state.loaded) return;
 
-  if (!query) {
-    state.filteredIcons = state.allIcons;
-  } else {
-    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    state.filteredIcons = state.allIcons.filter((icon) =>
-      terms.every((term) => icon.name.includes(term))
+  const terms    = query ? query.toLowerCase().split(/\s+/).filter(Boolean) : [];
+  const category = state.selectedCategory;
+
+  state.filteredIcons = state.allIcons.filter((icon) => {
+    // Category filter
+    if (category && icon.category !== category) return false;
+
+    // Text search — match name OR any tag
+    if (terms.length === 0) return true;
+    return terms.every((term) =>
+      icon.name.includes(term) ||
+      icon.tags.some((tag) => tag.toLowerCase().includes(term))
     );
-  }
+  });
 
   const total    = state.allIcons.length;
   const filtered = state.filteredIcons.length;
@@ -408,6 +458,30 @@ function buildPreviewSvg(icon, color, size) {
   svg.setAttribute('aria-hidden', 'true');
   svg.innerHTML = icon.pathData;
   return svg;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   CATEGORY FILTER
+═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Populate the category <select> with all unique categories from the icon set,
+ * sorted alphabetically. Called once after icons are loaded.
+ */
+function populateCategoryFilter(icons) {
+  const select = els.categoryFilter();
+  if (!select) return;
+
+  const categories = [...new Set(icons.map((i) => i.category).filter(Boolean))].sort();
+
+  // Keep the "All categories" option and append the rest
+  select.innerHTML = '<option value="">All categories</option>';
+  categories.forEach((cat) => {
+    const opt       = document.createElement('option');
+    opt.value       = cat;
+    opt.textContent = cat;
+    select.appendChild(opt);
+  });
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -647,7 +721,7 @@ function svgToDataUrl(svgString, width, height) {
       resolve(canvas.toDataURL('image/png'));
     };
 
-    img.onerror = (e) => {
+    img.onerror = () => {
       URL.revokeObjectURL(url);
       reject(new Error('SVG-to-PNG conversion failed'));
     };
@@ -743,6 +817,16 @@ function bindControls() {
 
   els.searchClear().addEventListener('click', clearSearch);
 
+  // Category filter
+  const categoryFilter = els.categoryFilter();
+  if (categoryFilter) {
+    categoryFilter.addEventListener('change', (e) => {
+      state.selectedCategory = e.target.value;
+      // Re-run search with the current query text so both filters apply
+      searchIcons(els.searchInput().value.trim());
+    });
+  }
+
   // Native colour picker (the rainbow swatch)
   const colorPicker = els.colorPicker();
   if (colorPicker) {
@@ -800,9 +884,12 @@ function bindControls() {
 
   // Retry button
   els.retryBtn().addEventListener('click', () => {
-    state.loaded = false;
-    state.allIcons = [];
-    state.filteredIcons = [];
+    state.loaded           = false;
+    state.allIcons         = [];
+    state.filteredIcons    = [];
+    state.selectedCategory = '';
+    const cf = els.categoryFilter();
+    if (cf) cf.value = '';
     loadIcons();
   });
 
